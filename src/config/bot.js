@@ -15,7 +15,7 @@ export const botConfig = {
   // - "invisible" = appears offline
   presence: {
     // Current online state shown on Discord.
-    status: "online",
+    status: "dnd",
 
     // Activity lines shown under the bot name.
     // `type` number mapping from Discord:
@@ -28,7 +28,7 @@ export const botConfig = {
     activities: [
       {
         name: "Niveous Staff", // required by Discord API, not shown in the client
-        state: "v!help | Always active", // this is what people actually see
+        state: "You're making me blush",     // this is what people actually see
         type: 4,               // Custom
       },
     ],
@@ -577,6 +577,115 @@ export function getRandomColor() {
 }
 
 // =========================================================
+// MOOD SYSTEM (bot "feelings" — shifts based on how people treat it)
+// =========================================================
+// Mood is a single number from -100 (very upset) to 100 (ecstatic).
+// It only changes the custom status TEXT, never the presence dot
+// (status stays whatever botConfig.presence.status is set to).
+export const moodConfig = {
+  // Starting mood on boot.
+  startingMood: 0,
+  // How much mood shifts per detected compliment / insult.
+  complimentAmount: 8,
+  insultAmount: -10,
+  // Mood slowly drifts back toward 0 over time.
+  decayAmount: 5,
+  decayIntervalMs: 15 * 60 * 1000, // every 15 minutes
+  // Phrases that shift mood. Simple substring match, case-insensitive.
+  // Add more of your own anytime — no code changes needed elsewhere.
+  compliments: [
+    "good bot", "great bot", "smart bot", "nice bot", "love you",
+    "i love you", "you're the best", "youre the best", "thank you bot",
+    "thanks bot", "amazing bot", "well done bot", "you're awesome",
+    "youre awesome", "best bot",
+  ],
+  insults: [
+    "bad bot", "stupid bot", "dumb bot", "useless bot", "worst bot",
+    "hate you", "i hate you", "shut up bot", "you suck", "terrible bot",
+    "trash bot", "garbage bot",
+  ],
+  // Mood tiers, checked from highest to lowest.
+  tiers: [
+    { min: 60, label: "Ecstatic", emoji: "🥰", color: "success", state: "Feeling the love right now 🥰" },
+    { min: 20, label: "Happy", emoji: "😊", color: "blurple", state: "Having a pretty good day 😊" },
+    { min: -19, label: "Neutral", emoji: "😐", color: "gray", state: "You're making me blush" },
+    { min: -59, label: "Annoyed", emoji: "😒", color: "warning", state: "A little annoyed today 😒" },
+    { min: -100, label: "Upset", emoji: "💔", color: "error", state: "Feeling pretty hurt right now 💔" },
+  ],
+};
+
+const moodState = {
+  value: moodConfig.startingMood,
+};
+
+function getMoodTier(value = moodState.value) {
+  return moodConfig.tiers.find((tier) => value >= tier.min) ?? moodConfig.tiers[moodConfig.tiers.length - 1];
+}
+
+function clampMood(value) {
+  return Math.max(-100, Math.min(100, value));
+}
+
+// Adjusts mood and, only if the tier actually changed, refreshes the
+// custom status text. The presence "status" dot never changes here.
+function adjustMood(amount, client) {
+  const previousTier = getMoodTier();
+  moodState.value = clampMood(moodState.value + amount);
+  const newTier = getMoodTier();
+  if (newTier.label !== previousTier.label && client?.user) {
+    applyMoodPresence(client);
+  }
+}
+
+function applyMoodPresence(client) {
+  const tier = getMoodTier();
+  client.user.setPresence({
+    status: botConfig.presence.status, // untouched — respects the configured status
+    activities: [
+      {
+        name: botConfig.presence.activities[0]?.name ?? "Niveous Staff",
+        state: tier.state,
+        type: botConfig.presence.activities[0]?.type ?? 4,
+      },
+    ],
+  });
+}
+
+// Detects a compliment/insult aimed at the bot. Triggers when the bot
+// is mentioned or the message directly replies to one of its messages.
+function detectMoodShift(message, client) {
+  const content = message.content.toLowerCase();
+  const mentionsBot = message.mentions.has(client.user);
+  const mentionsBotWord = /\bbot\b/.test(content);
+  if (!mentionsBot && !mentionsBotWord) return 0;
+
+  if (moodConfig.compliments.some((phrase) => content.includes(phrase))) {
+    return moodConfig.complimentAmount;
+  }
+  if (moodConfig.insults.some((phrase) => content.includes(phrase))) {
+    return moodConfig.insultAmount;
+  }
+  return 0;
+}
+
+function startMoodDecay(client) {
+  setInterval(() => {
+    if (moodState.value === 0) return;
+    const decayed = moodState.value > 0
+      ? Math.max(0, moodState.value - moodConfig.decayAmount)
+      : Math.min(0, moodState.value + moodConfig.decayAmount);
+    if (decayed !== moodState.value) {
+      const previousTier = getMoodTier();
+      moodState.value = decayed;
+      const newTier = getMoodTier();
+      if (newTier.label !== previousTier.label) {
+        applyMoodPresence(client);
+      }
+    }
+  }, moodConfig.decayIntervalMs).unref?.();
+}
+
+// =========================================================
 // BOT STARTUP (error handling wired in so the bot stays online)
 // =========================================================
 
@@ -605,6 +714,9 @@ client.on('warn', (info) => logger.debug('Client warning:', info));
 
 client.once('ready', () => {
   logger.debug(`Logged in as ${client.user.tag}`);
+  // Presence starts exactly as configured in botConfig.presence — untouched.
+  // Mood only kicks in once something actually shifts it.
+  startMoodDecay(client);
 });
 
 // Slash commands: wrapped in try/catch so one broken command can't crash the bot.
@@ -627,6 +739,18 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
+// Mood detection: runs on every message, independent of the command prefix,
+// so compliments/insults land whether or not they use "v!".
+client.on('messageCreate', (message) => {
+  if (message.author.bot) return;
+  try {
+    const shift = detectMoodShift(message, client);
+    if (shift !== 0) adjustMood(shift, client);
+  } catch (err) {
+    logger.error('Error updating mood:', err);
+  }
+});
+
 // Prefix commands ("v!"): same idea, try/catch so it can't crash the bot.
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
@@ -635,6 +759,21 @@ client.on('messageCreate', async (message) => {
 
   const args = message.content.slice(prefix.length).trim().split(/\s+/);
   const commandName = args.shift().toLowerCase();
+
+  // Built-in mood command — shows current feeling without needing a
+  // separate command file.
+  if (commandName === 'mood') {
+    const tier = getMoodTier();
+    await message.reply({
+      embeds: [{
+        title: `${tier.emoji} Current mood: ${tier.label}`,
+        description: `Mood score: ${moodState.value} / 100`,
+        color: getColor(tier.color),
+      }],
+    }).catch(() => {});
+    return;
+  }
+
   const command = client.prefixCommands?.get(commandName);
   if (!command) return;
 
