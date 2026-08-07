@@ -1,4 +1,9 @@
+import { Client, GatewayIntentBits } from 'discord.js';
 import { logger } from '../utils/logger.js';
+
+// =========================================================
+// CONFIG
+// =========================================================
 export const botConfig = {
   // =========================
   // BOT PRESENCE (what users see under the bot name)
@@ -414,6 +419,7 @@ export const botConfig = {
     music: true,
   },
 };
+
 export function validateConfig(config) {
   const errors = [];
   if (process.env.NODE_ENV !== 'production') {
@@ -449,6 +455,7 @@ export function validateConfig(config) {
   }
   return errors;
 }
+
 const configErrors = validateConfig(botConfig);
 if (configErrors.length > 0) {
   logger.error("Bot configuration errors:", configErrors.join("\n"));
@@ -456,7 +463,9 @@ if (configErrors.length > 0) {
     process.exit(1);
   }
 }
+
 export const BotConfig = botConfig;
+
 const COMMAND_CATEGORY_FEATURE_MAP = {
   birthday: "birthday",
   community: "community",
@@ -477,26 +486,32 @@ const COMMAND_CATEGORY_FEATURE_MAP = {
   verification: "verification",
   welcome: "welcome",
 };
+
 function normalizeCategoryKey(category) {
   return String(category || "").trim().toLowerCase().replace(/\s+/g, "_");
 }
+
 export function getCommandPrefix() {
   return botConfig.commands?.prefix ?? "!";
 }
+
 export function getBotOwners() {
   return (botConfig.commands?.owners ?? [])
     .map((id) => String(id).trim())
     .filter(Boolean);
 }
+
 export function isBotOwner(userId) {
   if (!userId) {
     return false;
   }
   return getBotOwners().includes(String(userId));
 }
+
 export function isMaintenanceMode() {
   return botConfig.commands?.maintenanceMode === true;
 }
+
 export function getBotMessage(key, replacements = {}) {
   let message = botConfig.messages?.[key] || key;
   for (const [placeholder, value] of Object.entries(replacements)) {
@@ -504,12 +519,14 @@ export function getBotMessage(key, replacements = {}) {
   }
   return message;
 }
+
 export function isFeatureEnabled(featureKey) {
   if (!featureKey) {
     return true;
   }
   return botConfig.features?.[featureKey] !== false;
 }
+
 export function isCommandCategoryEnabled(category) {
   const normalized = normalizeCategoryKey(category);
   if (!normalized || normalized === "core") {
@@ -521,21 +538,22 @@ export function isCommandCategoryEnabled(category) {
   }
   return isFeatureEnabled(featureKey);
 }
+
 export function getApplicationStatusColor(status) {
   const colors = botConfig.applications?.statusColors || {};
   const hex = colors[status];
   return hex ? getColor(hex) : getColor(status === "approved" ? "success" : status === "denied" ? "error" : "warning");
 }
+
 export function getDefaultApplicationQuestions() {
   return (botConfig.applications?.defaultQuestions || []).map((entry) =>
     typeof entry === "string" ? entry : entry.question,
   ).filter(Boolean);
 }
+
 export function getColor(path, fallback = "#99AAB5") {
-  
   if (typeof path === "number") return path;
   if (typeof path === "string" && path.startsWith("#")) {
-    
     return parseInt(path.replace("#", ""), 16);
   }
   const result = path
@@ -544,12 +562,12 @@ export function getColor(path, fallback = "#99AAB5") {
       (obj, key) => (obj && obj[key] !== undefined ? obj[key] : fallback),
       botConfig.embeds.colors,
     );
-  
   if (typeof result === "string" && result.startsWith("#")) {
     return parseInt(result.replace("#", ""), 16);
   }
   return result;
 }
+
 export function getRandomColor() {
   const colors = Object.values(botConfig.embeds.colors).flatMap((color) =>
     typeof color === "string" ? color : Object.values(color),
@@ -557,4 +575,76 @@ export function getRandomColor() {
   return colors[Math.floor(Math.random() * colors.length)];
 }
 
-export default botConfig;
+// =========================================================
+// BOT STARTUP (error handling wired in so the bot stays online)
+// =========================================================
+
+// Catch errors that would otherwise crash the whole process.
+process.on('unhandledRejection', (err) => {
+  logger.error('Unhandled promise rejection:', err);
+});
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception:', err);
+});
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    // add whatever other intents your bot already uses
+  ],
+  presence: botConfig.presence,
+});
+
+// Catch Discord client-level errors instead of letting them crash silently.
+client.on('error', (err) => logger.error('Client error:', err));
+client.on('shardError', (err) => logger.error('Shard error:', err));
+client.on('warn', (info) => logger.debug('Client warning:', info));
+
+client.once('ready', () => {
+  logger.debug(`Logged in as ${client.user.tag}`);
+});
+
+// Slash commands: wrapped in try/catch so one broken command can't crash the bot.
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const command = client.commands?.get(interaction.commandName);
+  if (!command) return;
+
+  try {
+    await command.execute(interaction);
+  } catch (err) {
+    logger.error(`Error executing command "${interaction.commandName}":`, err);
+    const replyPayload = { content: getBotMessage('errorOccurred'), ephemeral: true };
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp(replyPayload).catch(() => {});
+    } else {
+      await interaction.reply(replyPayload).catch(() => {});
+    }
+  }
+});
+
+// Prefix commands ("v!"): same idea, try/catch so it can't crash the bot.
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+  const prefix = getCommandPrefix(); // "v!"
+  if (!message.content.startsWith(prefix)) return;
+
+  const args = message.content.slice(prefix.length).trim().split(/\s+/);
+  const commandName = args.shift().toLowerCase();
+  const command = client.prefixCommands?.get(commandName);
+  if (!command) return;
+
+  try {
+    await command.execute(message, args);
+  } catch (err) {
+    logger.error(`Error executing prefix command "${commandName}":`, err);
+    await message.reply(getBotMessage('errorOccurred')).catch(() => {});
+  }
+});
+
+client.login(process.env.DISCORD_TOKEN || process.env.TOKEN);
+
+export default client;
