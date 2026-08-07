@@ -28,7 +28,7 @@ export const botConfig = {
     activities: [
       {
         name: "Niveous Staff", // required by Discord API, not shown in the client
-        state: "stalking",     // this is what people actually see
+        state: "You're making me blush",     // this is what people actually see
         type: 4,               // Custom
       },
     ],
