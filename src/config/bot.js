@@ -15,7 +15,7 @@ export const botConfig = {
   // - "invisible" = appears offline
   presence: {
     // Current online state shown on Discord.
-    status: "dnd",
+    status: "online",
 
     // Activity lines shown under the bot name.
     // `type` number mapping from Discord:
@@ -28,7 +28,7 @@ export const botConfig = {
     activities: [
       {
         name: "Niveous Staff", // required by Discord API, not shown in the client
-        state: "You're making me blush",     // this is what people actually see
+        state: "v!help | Always active", // this is what people actually see
         type: 4,               // Custom
       },
     ],
@@ -50,6 +50,7 @@ export const botConfig = {
     maintenanceMode: process.env.MAINTENANCE_MODE === "true",
     // Command prefix for text-based commands (e.g., "!" for "!ping").
     // Supports both slash commands and prefix commands.
+    // Jockie Music uses "m!" — this bot (Vlein) uses "v!" to avoid collisions.
     prefix: process.env.PREFIX || "v!",
   },
   // =========================
