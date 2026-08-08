@@ -27,7 +27,7 @@ export const botConfig = {
     // 5 = Competing
     activities: [
       {
-        name: "Niveous Staff", // required by Discord API, not shown in the client
+        name: "Vlein", // required by Discord API, not shown in the client
         state: "You're making me blush",     // this is what people actually see
         type: 4,               // Custom
       },
@@ -662,7 +662,7 @@ function applyMoodPresence(client) {
       status: botConfig.presence.status, // untouched — respects the configured status
       activities: [
         {
-          name: botConfig.presence.activities[0]?.name ?? "Niveous Staff",
+          name: botConfig.presence.activities[0]?.name ?? "Vlein",
           state: tier.state,
           type: botConfig.presence.activities[0]?.type ?? 4,
         },
@@ -769,7 +769,8 @@ async function getVleinReply(userMessage, moodLabel) {
 // Detects a compliment/insult aimed at the bot. Triggers when the bot
 // is mentioned or the message directly replies to one of its messages.
 function detectMoodShift(message, client) {
-  const content = message.content.toLowerCase();
+  // Cap length so a huge pasted message can't cost extra processing time.
+  const content = (message.content ?? '').slice(0, 2000).toLowerCase();
   const mentionsBot = message.mentions.has(client.user);
   const mentionsBotWord = /\bbot\b/.test(content);
   if (!mentionsBot && !mentionsBotWord) return 0;
@@ -906,6 +907,149 @@ function buildMusicProfileEmbed(targetUser) {
 }
 
 // =========================================================
+// MUSIC PLAYBACK (v!play — handles both a single track and a playlist)
+// =========================================================
+// I don't have your actual Lavalink/player manager file, so this looks
+// for it under a few common property names. If your manager lives
+// somewhere else (or uses different method names), this is the ONE
+// function to edit — everything else below calls through it.
+function getMusicManager(client) {
+  return client.lavalink ?? client.manager ?? client.riffy ?? client.kazagumo ?? client.music ?? null;
+}
+
+export const musicPlaybackConfig = {
+  // Tried in order for plain search terms (not direct links). If your
+  // Lavalink node's YouTube search is broken/blocked — the #1 cause of
+  // "loadType: error" — this lets the bot fall through to the next
+  // source instead of just failing. Remove/reorder sources to match
+  // whichever plugins your Lavalink node actually has enabled.
+  searchSources: ["ytsearch", "ytmsearch", "scsearch"],
+};
+
+function isDirectLink(query) {
+  return /^https?:\/\//i.test(query.trim());
+}
+
+// Tries each configured source in turn (for plain search terms) and
+// returns the first successful result. A direct link is searched as-is,
+// with no source prefix, since it's already unambiguous.
+async function searchWithFallback(manager, query, requesterId) {
+  if (isDirectLink(query)) {
+    const result = await (manager.search?.({ query }, requesterId) ?? manager.resolve?.({ query, requester: requesterId }));
+    return { result, sourceTried: null };
+  }
+
+  let lastResult = null;
+  for (const source of musicPlaybackConfig.searchSources) {
+    try {
+      const result = await (manager.search?.({ query, source }, requesterId)
+        ?? manager.resolve?.({ query, source, requester: requesterId }));
+      lastResult = result;
+
+      const loadType = result?.loadType;
+      const succeeded = loadType && !["empty", "NO_MATCHES", "error", "LOAD_FAILED"].includes(loadType);
+      if (succeeded) {
+        return { result, sourceTried: source };
+      }
+      logger.debug(`Search source "${source}" failed for "${query}" (loadType: ${loadType}), trying next source...`);
+    } catch (err) {
+      logger.error(`Search source "${source}" threw an error:`, err);
+    }
+  }
+  return { result: lastResult, sourceTried: null };
+}
+
+async function handlePlayCommand({ client, query, member, textChannelId, guildId, requesterId }) {
+  const manager = getMusicManager(client);
+  if (!manager) {
+    return { error: "Music isn't wired up correctly on this bot right now (no player manager found)." };
+  }
+
+  const voiceChannelId = member?.voice?.channelId;
+  if (!voiceChannelId) {
+    return { error: "You need to be in a voice channel first!" };
+  }
+
+  try {
+    // Get or create a player for this guild, connected to the user's channel.
+    let player = manager.getPlayer?.(guildId) ?? manager.players?.get?.(guildId);
+    if (!player) {
+      player = await (manager.createPlayer?.({
+        guildId,
+        voiceChannelId,
+        textChannelId,
+        selfDeaf: true,
+      }) ?? manager.create?.({
+        guild: guildId,
+        voiceChannel: voiceChannelId,
+        textChannel: textChannelId,
+        selfDeafen: true,
+      }));
+    }
+    if (player?.connect) await player.connect().catch(() => {});
+
+    // Search — tries multiple sources for plain search terms so one
+    // broken source (commonly YouTube) doesn't just kill the command.
+    const { result, sourceTried } = await searchWithFallback(manager, query, requesterId);
+
+    if (!result || result.loadType === "empty" || result.loadType === "NO_MATCHES") {
+      return { error: `No results found for **${query}** on any configured source.` };
+    }
+    if (result.loadType === "error" || result.loadType === "LOAD_FAILED") {
+      return { error: "All configured music sources failed to load that. Your Lavalink node's search plugins may need attention — check its logs/config." };
+    }
+
+    const isPlaylist = result.loadType === "playlist" || result.loadType === "PLAYLIST_LOADED";
+    const tracks = isPlaylist
+      ? (result.tracks ?? result.playlist?.tracks ?? [])
+      : [result.tracks?.[0] ?? result.track].filter(Boolean);
+
+    if (!tracks.length) {
+      return { error: `No results found for **${query}**.` };
+    }
+
+    // Queue everything Lavalink gave us — one track for a single song, or
+    // every track for a playlist load.
+    for (const track of tracks) {
+      player.queue?.add?.(track) ?? player.queue?.push?.(track);
+    }
+
+    if (!player.playing && !player.paused) {
+      await player.play?.().catch(() => {});
+    }
+
+    return {
+      isPlaylist,
+      count: tracks.length,
+      firstTitle: tracks[0]?.info?.title ?? tracks[0]?.title ?? query,
+      playlistName: result.playlist?.name ?? result.playlistInfo?.name ?? null,
+      sourceTried,
+    };
+  } catch (err) {
+    logger.error('Error in handlePlayCommand:', err);
+    return { error: "Something went wrong trying to play that." };
+  }
+}
+
+function buildPlayResultEmbed(outcome) {
+  if (outcome.error) {
+    return { title: "❌ Playback Error", description: outcome.error, color: getColor("error") };
+  }
+  if (outcome.isPlaylist) {
+    return {
+      title: "🎶 Playlist Queued",
+      description: `Added **${outcome.count}** tracks${outcome.playlistName ? ` from **${outcome.playlistName}**` : ""} to the queue.`,
+      color: getColor("music"),
+    };
+  }
+  return {
+    title: "🎵 Track Queued",
+    description: `Added **${outcome.firstTitle}** to the queue.`,
+    color: getColor("music"),
+  };
+}
+
+// =========================================================
 // BOT STARTUP (error handling wired in so the bot stays online)
 // =========================================================
 
@@ -916,6 +1060,36 @@ process.on('unhandledRejection', (err) => {
 process.on('uncaughtException', (err) => {
   logger.error('Uncaught exception:', err);
 });
+// Node-level warnings (deprecations, memory leak hints, etc.) — logged so
+// you can see them, but they never take the bot down.
+process.on('warning', (warning) => {
+  logger.debug('Process warning:', warning?.message ?? warning);
+});
+// Catches a promise being resolved/rejected more than once — usually a
+// sign of a bug in a listener, but logging it beats a silent crash.
+process.on('multipleResolves', (type, promise, reason) => {
+  logger.error(`Multiple resolves detected (${type}):`, reason);
+});
+
+// Graceful shutdown: when the host restarts/redeploys the bot (SIGTERM)
+// or it's stopped manually (SIGINT), log it and exit cleanly instead of
+// the process dying mid-request and leaving Discord/Lavalink connections
+// in a half-closed state.
+let isShuttingDown = false;
+function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  logger.debug(`Received ${signal}, shutting down gracefully...`);
+  try {
+    client.destroy();
+  } catch (err) {
+    logger.error('Error during shutdown:', err);
+  } finally {
+    process.exit(0);
+  }
+}
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 // Wraps any event listener so that, even if something inside forgets its
 // own try/catch (or throws before reaching one), the error is logged
@@ -1044,6 +1218,41 @@ client.on('messageCreate', safe('messageCreate:commands', async (message) => {
       await message.reply({ embeds: [embed] }).catch(() => {});
     } catch (err) {
       logger.error('Error building music profile:', err);
+      await message.reply(getBotMessage('errorOccurred')).catch(() => {});
+    }
+    return;
+  }
+
+  // Built-in "v!play" — mirrors your slash /play, handles both a single
+  // track and a full playlist load.
+  if (commandName === 'play') {
+    try {
+      if (!isFeatureEnabled('music')) {
+        await message.reply(getBotMessage('commandDisabled')).catch(() => {});
+        return;
+      }
+      const query = args.join(' ').trim();
+      if (!query) {
+        await message.reply('Give me a song name or link! Example: `v!play never gonna give you up`').catch(() => {});
+        return;
+      }
+
+      const outcome = await handlePlayCommand({
+        client,
+        query,
+        member: message.member,
+        textChannelId: message.channelId,
+        guildId: message.guildId,
+        requesterId: message.author.id,
+      });
+
+      await message.reply({ embeds: [buildPlayResultEmbed(outcome)] }).catch(() => {});
+
+      if (!outcome.error) {
+        recordSongPlay(message.author.id, outcome.isPlaylist ? (outcome.playlistName ?? outcome.firstTitle) : outcome.firstTitle);
+      }
+    } catch (err) {
+      logger.error('Error executing v!play:', err);
       await message.reply(getBotMessage('errorOccurred')).catch(() => {});
     }
     return;
