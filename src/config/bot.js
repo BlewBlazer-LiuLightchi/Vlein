@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits } from 'discord.js';
+import { Client, GatewayIntentBits, Partials } from 'discord.js';
 import { logger } from '../utils/logger.js';
 
 // =========================================================
@@ -1109,8 +1109,22 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    // add whatever other intents your bot already uses
+    // Fixes the bot leaving VC unexpectedly — without this, Discord.js
+    // never receives voice state/server updates, so the voice connection
+    // (and whatever Lavalink relies on it for) becomes unstable and drops.
+    GatewayIntentBits.GuildVoiceStates,
+    // Needed for accurate v!profile-style member counters and welcome/
+    // goodbye messages to fire on real join/leave events. This is a
+    // PRIVILEGED intent — enable "Server Members Intent" for this bot
+    // in the Discord Developer Portal (Bot tab) or it'll fail to log in.
+    GatewayIntentBits.GuildMembers,
+    // Needed for the reactionRoles feature to detect reaction add/remove.
+    GatewayIntentBits.GuildMessageReactions,
   ],
+  // Reaction events on messages not in the cache (e.g. after a restart)
+  // arrive as "partial" objects — this lets reactionRoles still catch them
+  // instead of silently missing older messages.
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction],
   presence: botConfig.presence,
 });
 
