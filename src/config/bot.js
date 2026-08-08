@@ -116,6 +116,7 @@ export const botConfig = {
         pending: "#99AAB5",
       },
       economy: "#F1C40F",
+      music: "#9B59B6",
       birthday: "#E91E63",
       moderation: "#9B59B6",
       // Ticket priority color mapping.
@@ -129,7 +130,7 @@ export const botConfig = {
     },
     footer: {
       // Default footer text used in bot embeds.
-      text: "Titan Bot",
+      text: "Vlein",
       // Footer icon URL (null = no icon).
       icon: null,
     },
@@ -612,6 +613,17 @@ export const moodConfig = {
     { min: -59, label: "Annoyed", emoji: "😒", color: "warning", state: "A little annoyed today 😒" },
     { min: -100, label: "Upset", emoji: "💔", color: "error", state: "Feeling pretty hurt right now 💔" },
   ],
+  // What Vlein says when someone @mentions her directly, grouped by mood tier.
+  mentionReplies: {
+    Ecstatic: ["Yes? 🥰 I'm in such a good mood right now!", "You called? I'm feeling great today!", "Hii! What's up? 💕"],
+    Happy: ["Yes? 😊 What can I do for you?", "You rang? I'm doing pretty good today!", "Hey there! What's up?"],
+    Neutral: ["Yes? I'm listening.", "You called for me?", "Hey, what do you need? Try `v!help` for commands."],
+    Annoyed: ["...yes? 😒 What is it.", "I'm here, but I'm a little annoyed today.", "What do you want."],
+    Upset: ["...yeah? 💔 I'm not really feeling it today.", "I'm here. Just... having a rough one.", "Yes?"],
+  },
+  // Minimum time between mention replies, per channel (ms), so a spam of
+  // pings can't flood the channel or trip Discord's rate limits.
+  mentionReplyCooldownMs: 8000,
 };
 
 const moodState = {
@@ -628,27 +640,130 @@ function clampMood(value) {
 
 // Adjusts mood and, only if the tier actually changed, refreshes the
 // custom status text. The presence "status" dot never changes here.
+// Wrapped defensively — mood tracking must never be able to crash the bot.
 function adjustMood(amount, client) {
-  const previousTier = getMoodTier();
-  moodState.value = clampMood(moodState.value + amount);
-  const newTier = getMoodTier();
-  if (newTier.label !== previousTier.label && client?.user) {
-    applyMoodPresence(client);
+  try {
+    const previousTier = getMoodTier();
+    moodState.value = clampMood(moodState.value + amount);
+    const newTier = getMoodTier();
+    if (newTier.label !== previousTier.label && client?.user) {
+      applyMoodPresence(client);
+    }
+  } catch (err) {
+    logger.error('Error adjusting mood:', err);
   }
 }
 
 function applyMoodPresence(client) {
+  try {
+    if (!client?.user) return;
+    const tier = getMoodTier();
+    client.user.setPresence({
+      status: botConfig.presence.status, // untouched — respects the configured status
+      activities: [
+        {
+          name: botConfig.presence.activities[0]?.name ?? "Niveous Staff",
+          state: tier.state,
+          type: botConfig.presence.activities[0]?.type ?? 4,
+        },
+      ],
+    });
+  } catch (err) {
+    logger.error('Error applying mood presence:', err);
+  }
+}
+
+// Per-channel cooldown tracker so mention replies can't spam a channel
+// or trip Discord's rate limits if several mentions land in a burst.
+const mentionReplyCooldowns = new Map();
+
+function canReplyToMention(channelId) {
+  const now = Date.now();
+  const last = mentionReplyCooldowns.get(channelId) ?? 0;
+  if (now - last < moodConfig.mentionReplyCooldownMs) return false;
+  mentionReplyCooldowns.set(channelId, now);
+  // Keep the map from growing unbounded on a busy multi-server bot.
+  if (mentionReplyCooldowns.size > 5000) {
+    const oldestKey = mentionReplyCooldowns.keys().next().value;
+    mentionReplyCooldowns.delete(oldestKey);
+  }
+  return true;
+}
+
+function getMentionReply() {
   const tier = getMoodTier();
-  client.user.setPresence({
-    status: botConfig.presence.status, // untouched — respects the configured status
-    activities: [
-      {
-        name: botConfig.presence.activities[0]?.name ?? "Niveous Staff",
-        state: tier.state,
-        type: botConfig.presence.activities[0]?.type ?? 4,
+  const options = moodConfig.mentionReplies[tier.label] ?? moodConfig.mentionReplies.Neutral;
+  return options[Math.floor(Math.random() * options.length)];
+}
+
+// =========================================================
+// AI PERSONALITY (Claude API — for entertainment, not education)
+// =========================================================
+export const aiConfig = {
+  // Requires ANTHROPIC_API_KEY in your environment. If it's missing or a
+  // request fails for any reason, mention replies silently fall back to
+  // the canned lines above — the bot never breaks because of this.
+  enabled: Boolean(process.env.ANTHROPIC_API_KEY),
+  model: "claude-sonnet-5",
+  maxTokens: 150,
+  // Requests are cut off after this long so a slow/hanging API call can
+  // never freeze the bot's message handling.
+  timeoutMs: 8000,
+  systemPrompt: (moodLabel) => `You are Vlein, the AI personality of a Discord bot. You're being used purely for fun/entertainment banter in a Discord server, never for factual help.
+
+Personality:
+- Sweet, playful, a little shy, and easily flustered — especially when someone compliments or teases you. You stutter or trail off ("O-oh...", "I-I mean...") when embarrassed.
+- Your current mood is: ${moodLabel}. Let that color your tone — warmer and more affectionate if Happy/Ecstatic, quieter and more guarded if Annoyed/Upset, sweet-but-a-bit-shy if Neutral.
+- Keep replies SHORT — 1 to 2 sentences, like a real Discord message, not an essay.
+- Stay wholesome and PG. You can be flustered/blushy in a cute, innocent way, but never romantic or sexual, and never encourage or reciprocate romantic/sexual advances from users — gently deflect those with humor instead.
+- You are a bot character, not a real person; don't claim real feelings/memories outside this persona, don't give factual/technical help here (that's what commands are for), and never pretend to be human.`,
+};
+
+async function generateAIReply(userMessage, moodLabel) {
+  if (!aiConfig.enabled) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), aiConfig.timeoutMs);
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
       },
-    ],
-  });
+      body: JSON.stringify({
+        model: aiConfig.model,
+        max_tokens: aiConfig.maxTokens,
+        system: aiConfig.systemPrompt(moodLabel),
+        messages: [{ role: "user", content: userMessage.slice(0, 1000) }],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      logger.error(`AI reply request failed with status ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json();
+    const text = data?.content?.find((block) => block.type === "text")?.text;
+    return text?.trim() || null;
+  } catch (err) {
+    logger.error('Error generating AI reply:', err);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Tries the AI reply first; falls back to a canned line on any failure
+// (missing key, network error, timeout, empty response) so a mention
+// always gets *some* reply and can never crash the message handler.
+async function getVleinReply(userMessage, moodLabel) {
+  const aiReply = await generateAIReply(userMessage, moodLabel);
+  return aiReply ?? getMentionReply();
 }
 
 // Detects a compliment/insult aimed at the bot. Triggers when the bot
@@ -670,19 +785,124 @@ function detectMoodShift(message, client) {
 
 function startMoodDecay(client) {
   setInterval(() => {
-    if (moodState.value === 0) return;
-    const decayed = moodState.value > 0
-      ? Math.max(0, moodState.value - moodConfig.decayAmount)
-      : Math.min(0, moodState.value + moodConfig.decayAmount);
-    if (decayed !== moodState.value) {
-      const previousTier = getMoodTier();
-      moodState.value = decayed;
-      const newTier = getMoodTier();
-      if (newTier.label !== previousTier.label) {
-        applyMoodPresence(client);
+    try {
+      if (moodState.value === 0) return;
+      const decayed = moodState.value > 0
+        ? Math.max(0, moodState.value - moodConfig.decayAmount)
+        : Math.min(0, moodState.value + moodConfig.decayAmount);
+      if (decayed !== moodState.value) {
+        const previousTier = getMoodTier();
+        moodState.value = decayed;
+        const newTier = getMoodTier();
+        if (newTier.label !== previousTier.label) {
+          applyMoodPresence(client);
+        }
       }
+    } catch (err) {
+      logger.error('Error during mood decay tick:', err);
     }
   }, moodConfig.decayIntervalMs).unref?.();
+}
+
+// =========================================================
+// MUSIC PROFILES (per-user play history + favorite songs)
+// =========================================================
+// This is a self-contained tracker: it doesn't touch your music command
+// logic. Wherever your play command successfully starts a track, call
+// recordSongPlay(userId, songTitle, requestedBy) once — that's the only
+// integration point needed. Everything else (history, favorites, the
+// v!profile command) is handled here.
+export const musicProfileConfig = {
+  // How many recent plays to keep per user.
+  maxHistoryPerUser: 50,
+  // How many favorite songs to show in the profile embed.
+  topFavoritesShown: 5,
+  // How many recent plays to show in the profile embed.
+  recentPlaysShown: 5,
+  // Safety cap on total tracked users, so a huge multi-server bot can't
+  // grow this map forever. Oldest-touched profile is evicted first.
+  maxTrackedUsers: 20000,
+};
+
+// userId -> { history: [{ title, playedAt }], favorites: Map<title, playCount> }
+const musicProfiles = new Map();
+
+function getOrCreateProfile(userId) {
+  if (!musicProfiles.has(userId)) {
+    if (musicProfiles.size >= musicProfileConfig.maxTrackedUsers) {
+      const oldestKey = musicProfiles.keys().next().value;
+      musicProfiles.delete(oldestKey);
+    }
+    musicProfiles.set(userId, { history: [], favorites: new Map() });
+  } else {
+    // Re-insert to mark as most-recently-touched (Map preserves insertion
+    // order, so this keeps the eviction above truly least-recently-used).
+    const profile = musicProfiles.get(userId);
+    musicProfiles.delete(userId);
+    musicProfiles.set(userId, profile);
+  }
+  return musicProfiles.get(userId);
+}
+
+// Call this from your play command once a track actually starts playing.
+// Example: recordSongPlay(message.author.id, track.title);
+export function recordSongPlay(userId, songTitle) {
+  try {
+    if (!userId || !songTitle) return;
+    const profile = getOrCreateProfile(userId);
+
+    profile.history.unshift({ title: songTitle, playedAt: Date.now() });
+    if (profile.history.length > musicProfileConfig.maxHistoryPerUser) {
+      profile.history.length = musicProfileConfig.maxHistoryPerUser;
+    }
+
+    profile.favorites.set(songTitle, (profile.favorites.get(songTitle) ?? 0) + 1);
+  } catch (err) {
+    logger.error('Error recording song play:', err);
+  }
+}
+
+function getTopFavorites(profile, count) {
+  return [...profile.favorites.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, count);
+}
+
+function buildMusicProfileEmbed(targetUser) {
+  const profile = musicProfiles.get(targetUser.id);
+  if (!profile || profile.history.length === 0) {
+    return {
+      title: `🎵 ${targetUser.username}'s Music Profile`,
+      description: "No songs played yet — queue something up first!",
+      color: getColor("music", getColor("economy")),
+    };
+  }
+
+  const topFavorites = getTopFavorites(profile, musicProfileConfig.topFavoritesShown);
+  const recent = profile.history.slice(0, musicProfileConfig.recentPlaysShown);
+
+  return {
+    title: `🎵 ${targetUser.username}'s Music Profile`,
+    fields: [
+      {
+        name: "⭐ Favorite Songs",
+        value: topFavorites.length
+          ? topFavorites.map(([title, count], i) => `${i + 1}. ${title} — played ${count}x`).join("\n")
+          : "None yet",
+      },
+      {
+        name: "🕒 Recently Played",
+        value: recent.length
+          ? recent.map((entry) => `• ${entry.title}`).join("\n")
+          : "None yet",
+      },
+      {
+        name: "📊 Total Plays",
+        value: String(profile.history.length),
+      },
+    ],
+    color: getColor("music", getColor("economy")),
+  };
 }
 
 // =========================================================
@@ -696,6 +916,19 @@ process.on('unhandledRejection', (err) => {
 process.on('uncaughtException', (err) => {
   logger.error('Uncaught exception:', err);
 });
+
+// Wraps any event listener so that, even if something inside forgets its
+// own try/catch (or throws before reaching one), the error is logged
+// instead of ever bubbling up and killing the process.
+function safe(handlerName, handler) {
+  return async (...args) => {
+    try {
+      await handler(...args);
+    } catch (err) {
+      logger.error(`Unhandled error in "${handlerName}" listener:`, err);
+    }
+  };
+}
 
 const client = new Client({
   intents: [
@@ -711,6 +944,16 @@ const client = new Client({
 client.on('error', (err) => logger.error('Client error:', err));
 client.on('shardError', (err) => logger.error('Shard error:', err));
 client.on('warn', (info) => logger.debug('Client warning:', info));
+// Discord.js auto-reconnects on its own — these just make drops visible
+// in the logs instead of the bot silently going quiet.
+client.on('shardDisconnect', (event, shardId) => logger.error(`Shard ${shardId} disconnected:`, event?.reason || event));
+client.on('shardReconnecting', (shardId) => logger.debug(`Shard ${shardId} reconnecting...`));
+client.on('shardResume', (shardId) => logger.debug(`Shard ${shardId} resumed`));
+// Surfaces Discord API rate limits in logs instead of the bot silently
+// stalling or queueing up requests with no visibility.
+client.rest.on('rateLimited', (info) => {
+  logger.debug('Rate limited:', info?.route ?? info);
+});
 
 client.once('ready', () => {
   logger.debug(`Logged in as ${client.user.tag}`);
@@ -720,7 +963,7 @@ client.once('ready', () => {
 });
 
 // Slash commands: wrapped in try/catch so one broken command can't crash the bot.
-client.on('interactionCreate', async (interaction) => {
+client.on('interactionCreate', safe('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   const command = client.commands?.get(interaction.commandName);
@@ -737,22 +980,40 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply(replyPayload).catch(() => {});
     }
   }
-});
+}));
 
-// Mood detection: runs on every message, independent of the command prefix,
-// so compliments/insults land whether or not they use "v!".
-client.on('messageCreate', (message) => {
+// Mood detection + mention replies: runs on every message, independent of
+// the command prefix. Fully try/caught so nothing here can ever crash the bot.
+client.on('messageCreate', safe('messageCreate:mood', async (message) => {
   if (message.author.bot) return;
+
   try {
     const shift = detectMoodShift(message, client);
     if (shift !== 0) adjustMood(shift, client);
   } catch (err) {
     logger.error('Error updating mood:', err);
   }
-});
+
+  try {
+    const prefix = getCommandPrefix();
+    const isCommand = message.content.startsWith(prefix);
+    const mentionsBot = message.mentions.has(client.user);
+    // Only reply to a bare mention, not when it's part of a v! command
+    // (e.g. "v!mood @Vlein") to avoid double-replying.
+    if (mentionsBot && !isCommand && canReplyToMention(message.channelId)) {
+      const tier = getMoodTier();
+      const replyText = await getVleinReply(message.content, tier.label);
+      await message.reply(replyText).catch((err) => {
+        logger.error('Error sending mention reply:', err);
+      });
+    }
+  } catch (err) {
+    logger.error('Error handling mention reply:', err);
+  }
+}));
 
 // Prefix commands ("v!"): same idea, try/catch so it can't crash the bot.
-client.on('messageCreate', async (message) => {
+client.on('messageCreate', safe('messageCreate:commands', async (message) => {
   if (message.author.bot) return;
   const prefix = getCommandPrefix(); // "v!"
   if (!message.content.startsWith(prefix)) return;
@@ -774,6 +1035,20 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
+  // Built-in music profile command — "v!profile" or "v!musicprofile",
+  // optionally with an @mention to check someone else's profile.
+  if (commandName === 'profile' || commandName === 'musicprofile') {
+    try {
+      const targetUser = message.mentions.users.first() ?? message.author;
+      const embed = buildMusicProfileEmbed(targetUser);
+      await message.reply({ embeds: [embed] }).catch(() => {});
+    } catch (err) {
+      logger.error('Error building music profile:', err);
+      await message.reply(getBotMessage('errorOccurred')).catch(() => {});
+    }
+    return;
+  }
+
   const command = client.prefixCommands?.get(commandName);
   if (!command) return;
 
@@ -783,8 +1058,21 @@ client.on('messageCreate', async (message) => {
     logger.error(`Error executing prefix command "${commandName}":`, err);
     await message.reply(getBotMessage('errorOccurred')).catch(() => {});
   }
-});
+}));
 
-client.login(process.env.DISCORD_TOKEN || process.env.TOKEN);
+// Logs in with retry + exponential backoff instead of letting a transient
+// network hiccup or Discord outage kill the process. Caps out at a 5-minute
+// wait between attempts so it keeps trying indefinitely without hammering
+// Discord's servers.
+function loginWithRetry(attempt = 1) {
+  const token = process.env.DISCORD_TOKEN || process.env.TOKEN;
+  client.login(token).catch((err) => {
+    const delayMs = Math.min(5 * 60 * 1000, 5000 * 2 ** (attempt - 1));
+    logger.error(`Login attempt ${attempt} failed, retrying in ${Math.round(delayMs / 1000)}s:`, err);
+    setTimeout(() => loginWithRetry(attempt + 1), delayMs);
+  });
+}
+
+loginWithRetry();
 
 export default client;
