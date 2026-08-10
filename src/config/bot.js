@@ -1050,6 +1050,83 @@ function buildPlayResultEmbed(outcome) {
 }
 
 // =========================================================
+// COMMAND COOLDOWNS + MAINTENANCE MODE (actually enforcing config that
+// previously existed but was never checked anywhere)
+// =========================================================
+const commandCooldowns = new Map(); // "userId:commandName" -> last-used timestamp
+
+function checkCooldown(userId, commandName) {
+  const cooldownMs = (botConfig.commands?.defaultCooldown ?? 3) * 1000;
+  const key = `${userId}:${commandName}`;
+  const now = Date.now();
+  const last = commandCooldowns.get(key) ?? 0;
+  const remainingMs = cooldownMs - (now - last);
+
+  if (remainingMs > 0) {
+    return { onCooldown: true, remainingSeconds: Math.ceil(remainingMs / 1000) };
+  }
+
+  commandCooldowns.set(key, now);
+  // Prevent unbounded growth on a busy multi-server bot.
+  if (commandCooldowns.size > 20000) {
+    const oldestKey = commandCooldowns.keys().next().value;
+    commandCooldowns.delete(oldestKey);
+  }
+  return { onCooldown: false };
+}
+
+function formatUptime(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const parts = [];
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  if (minutes) parts.push(`${minutes}m`);
+  parts.push(`${seconds}s`);
+  return parts.join(' ');
+}
+
+const builtInCommandList = [
+  { name: 'help', description: 'Shows this list of commands' },
+  { name: 'ping', description: "Shows Vlein's latency" },
+  { name: 'uptime', description: 'Shows how long Vlein has been running' },
+  { name: 'stats', description: "Shows Vlein's server/guild stats" },
+  { name: 'mood', description: "Shows Vlein's current mood" },
+  { name: 'profile [@user]', description: "Shows a music profile (yours or someone else's)" },
+  { name: 'play <song or link>', description: 'Plays a song or playlist in your voice channel' },
+];
+
+function buildHelpEmbed() {
+  const prefix = getCommandPrefix();
+  return {
+    title: '📖 Vlein — Commands',
+    description: builtInCommandList
+      .map((cmd) => `\`${prefix}${cmd.name}\` — ${cmd.description}`)
+      .join('\n'),
+    color: getColor('primary'),
+    footer: { text: botConfig.embeds.footer.text },
+  };
+}
+
+function buildStatsEmbed(client) {
+  const tier = getMoodTier();
+  return {
+    title: '📊 Vlein — Stats',
+    fields: [
+      { name: 'Servers', value: String(client.guilds.cache.size), inline: true },
+      { name: 'Ping', value: `${client.ws.ping}ms`, inline: true },
+      { name: 'Uptime', value: formatUptime(client.uptime ?? 0), inline: true },
+      { name: 'Mood', value: `${tier.emoji} ${tier.label}`, inline: true },
+    ],
+    color: getColor('primary'),
+    footer: { text: botConfig.embeds.footer.text },
+  };
+}
+
+// =========================================================
 // BOT STARTUP (error handling wired in so the bot stays online)
 // =========================================================
 
@@ -1208,6 +1285,55 @@ client.on('messageCreate', safe('messageCreate:commands', async (message) => {
 
   const args = message.content.slice(prefix.length).trim().split(/\s+/);
   const commandName = args.shift().toLowerCase();
+
+  // Maintenance mode — only bot owners can run commands while it's on.
+  // (botConfig.commands.maintenanceMode / OWNER_IDS were already in
+  // config but never actually checked anywhere until now.)
+  if (isMaintenanceMode() && !isBotOwner(message.author.id)) {
+    await message.reply(getBotMessage('maintenanceMode')).catch(() => {});
+    return;
+  }
+
+  // Per-user, per-command cooldown using the configured default.
+  const cooldown = checkCooldown(message.author.id, commandName);
+  if (cooldown.onCooldown) {
+    await message.reply(getBotMessage('cooldownActive', { time: `${cooldown.remainingSeconds}s` })).catch(() => {});
+    return;
+  }
+
+  // Built-in help command — lists everything below.
+  if (commandName === 'help') {
+    await message.reply({ embeds: [buildHelpEmbed()] }).catch(() => {});
+    return;
+  }
+
+  // Built-in ping command — round-trip + WebSocket latency.
+  if (commandName === 'ping') {
+    const sent = await message.reply('Pinging...').catch(() => null);
+    if (!sent) return;
+    const roundTripMs = sent.createdTimestamp - message.createdTimestamp;
+    await sent.edit({
+      content: null,
+      embeds: [{
+        title: '🏓 Pong!',
+        description: `Round-trip: **${roundTripMs}ms**\nWebSocket: **${client.ws.ping}ms**`,
+        color: getColor('primary'),
+      }],
+    }).catch(() => {});
+    return;
+  }
+
+  // Built-in uptime command.
+  if (commandName === 'uptime') {
+    await message.reply(`⏱️ I've been running for **${formatUptime(client.uptime ?? 0)}**.`).catch(() => {});
+    return;
+  }
+
+  // Built-in stats command.
+  if (commandName === 'stats') {
+    await message.reply({ embeds: [buildStatsEmbed(client)] }).catch(() => {});
+    return;
+  }
 
   // Built-in mood command — shows current feeling without needing a
   // separate command file.
