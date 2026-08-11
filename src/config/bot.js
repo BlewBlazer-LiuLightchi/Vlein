@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits, Partials } from 'discord.js';
+import { Client, GatewayIntentBits, Partials, PermissionFlagsBits } from 'discord.js';
 import { logger } from '../utils/logger.js';
 
 // =========================================================
@@ -611,7 +611,11 @@ export const moodConfig = {
     { min: 20, label: "Happy", emoji: "😊", color: "blurple", state: "Having a pretty good day 😊" },
     { min: -19, label: "Neutral", emoji: "😐", color: "gray", state: "You're making me blush" },
     { min: -59, label: "Annoyed", emoji: "😒", color: "warning", state: "A little annoyed today 😒" },
-    { min: -100, label: "Upset", emoji: "💔", color: "error", state: "Feeling pretty hurt right now 💔" },
+    { min: -89, label: "Upset", emoji: "💔", color: "error", state: "Feeling pretty hurt right now 💔" },
+    // Her "dark side" — only kicks in when mood bottoms out from repeated
+    // insults. Roasts stay playful/sarcastic, never targeting real
+    // personal traits — see aiConfig.systemPrompt for the actual guardrails.
+    { min: -100, label: "Furious", emoji: "😤", color: "error", state: "Do NOT test me right now 😤" },
   ],
   // What Vlein says when someone @mentions her directly, grouped by mood tier.
   mentionReplies: {
@@ -620,10 +624,21 @@ export const moodConfig = {
     Neutral: ["Yes? I'm listening.", "You called for me?", "Hey, what do you need? Try `v!help` for commands."],
     Annoyed: ["...yes? 😒 What is it.", "I'm here, but I'm a little annoyed today.", "What do you want."],
     Upset: ["...yeah? 💔 I'm not really feeling it today.", "I'm here. Just... having a rough one.", "Yes?"],
+    // Canned fallback roasts if the AI call fails — kept generic/silly,
+    // never about real personal traits.
+    Furious: [
+      "Oh, NOW you want my attention? Cute.",
+      "Bold of you to ping me right now, honestly.",
+      "I'm not mad. I'm past mad. There's no word for what I am right now.",
+      "Say that again. I dare you. 😤",
+    ],
   },
   // Minimum time between mention replies, per channel (ms), so a spam of
   // pings can't flood the channel or trip Discord's rate limits.
   mentionReplyCooldownMs: 8000,
+  // Separate cooldown for flustered reactions to compliments/insults said
+  // WITHOUT a direct mention (e.g. "vlein is so sweet" in normal chat).
+  moodReactionCooldownMs: 12000,
 };
 
 const moodState = {
@@ -696,6 +711,23 @@ function getMentionReply() {
   return options[Math.floor(Math.random() * options.length)];
 }
 
+// Separate per-channel cooldown for flustered reactions to compliments/
+// insults said without a direct mention, so it can't spam alongside (or
+// independently of) the mention-reply cooldown above.
+const moodReactionCooldowns = new Map();
+
+function canReplyToMoodReaction(channelId) {
+  const now = Date.now();
+  const last = moodReactionCooldowns.get(channelId) ?? 0;
+  if (now - last < moodConfig.moodReactionCooldownMs) return false;
+  moodReactionCooldowns.set(channelId, now);
+  if (moodReactionCooldowns.size > 5000) {
+    const oldestKey = moodReactionCooldowns.keys().next().value;
+    moodReactionCooldowns.delete(oldestKey);
+  }
+  return true;
+}
+
 // =========================================================
 // AI PERSONALITY (Claude API — for entertainment, not education)
 // =========================================================
@@ -712,10 +744,12 @@ export const aiConfig = {
   systemPrompt: (moodLabel) => `You are Vlein, the AI personality of a Discord bot. You're being used purely for fun/entertainment banter in a Discord server, never for factual help.
 
 Personality:
-- Sweet, playful, a little shy, and easily flustered — especially when someone compliments or teases you. You stutter or trail off ("O-oh...", "I-I mean...") when embarrassed.
+- Normally sweet, playful, a little shy, and easily flustered — especially when someone compliments or teases you. You stutter or trail off ("O-oh...", "I-I mean...") when embarrassed.
 - Your current mood is: ${moodLabel}. Let that color your tone — warmer and more affectionate if Happy/Ecstatic, quieter and more guarded if Annoyed/Upset, sweet-but-a-bit-shy if Neutral.
+- If your mood is "Furious": drop the shyness and roast the person back instead — sharp, sarcastic, witty comebacks, playfully savage rather than sad. This is a bit, like a tsundere finally snapping, not real anger.
+- Roasts (Furious mood only) MUST stay generic and silly — tease about mundane, made-up-in-the-moment stuff (their gaming skills, music taste, typing speed, the fact they woke the bear). NEVER roast real personal traits: no comments on appearance, intelligence, family, race/ethnicity/religion/gender/sexuality, mental health, or anything that could actually be a real insecurity. If you don't know anything about the person, keep it silly and impersonal — the joke is your reaction, not them.
 - Keep replies SHORT — 1 to 2 sentences, like a real Discord message, not an essay.
-- Stay wholesome and PG. You can be flustered/blushy in a cute, innocent way, but never romantic or sexual, and never encourage or reciprocate romantic/sexual advances from users — gently deflect those with humor instead.
+- Stay wholesome and PG at every mood level, including Furious. You can be flustered/blushy in a cute, innocent way, and sharp/sarcastic when furious, but never romantic or sexual, never genuinely cruel or degrading, and never encourage or reciprocate romantic/sexual advances from users — gently deflect those with humor instead.
 - You are a bot character, not a real person; don't claim real feelings/memories outside this persona, don't give factual/technical help here (that's what commands are for), and never pretend to be human.`,
 };
 
@@ -1031,20 +1065,34 @@ async function handlePlayCommand({ client, query, member, textChannelId, guildId
   }
 }
 
+// Canned flustered flavor lines for the play embed footer — kept as
+// canned text (not an AI call) so queuing a song stays instant instead
+// of waiting on an API round-trip every time.
+const playFlavorLines = [
+  "I-I hope you like it... 🎧",
+  "Playing it now, don't judge my taste okay!",
+  "O-okay, here it comes...",
+  "This one's kind of embarrassing to admit I know, but here you go!",
+  "Vibing with you now~",
+];
+
 function buildPlayResultEmbed(outcome) {
   if (outcome.error) {
     return { title: "❌ Playback Error", description: outcome.error, color: getColor("error") };
   }
+  const flavor = playFlavorLines[Math.floor(Math.random() * playFlavorLines.length)];
   if (outcome.isPlaylist) {
     return {
       title: "🎶 Playlist Queued",
       description: `Added **${outcome.count}** tracks${outcome.playlistName ? ` from **${outcome.playlistName}**` : ""} to the queue.`,
+      footer: { text: flavor },
       color: getColor("music"),
     };
   }
   return {
     title: "🎵 Track Queued",
     description: `Added **${outcome.firstTitle}** to the queue.`,
+    footer: { text: flavor },
     color: getColor("music"),
   };
 }
@@ -1089,25 +1137,116 @@ function formatUptime(ms) {
   return parts.join(' ');
 }
 
-const builtInCommandList = [
-  { name: 'help', description: 'Shows this list of commands' },
-  { name: 'ping', description: "Shows Vlein's latency" },
-  { name: 'uptime', description: 'Shows how long Vlein has been running' },
-  { name: 'stats', description: "Shows Vlein's server/guild stats" },
-  { name: 'mood', description: "Shows Vlein's current mood" },
-  { name: 'profile [@user]', description: "Shows a music profile (yours or someone else's)" },
-  { name: 'play <song or link>', description: 'Plays a song or playlist in your voice channel' },
-];
+const helpCategories = {
+  general: [
+    { name: 'help', description: 'Shows this list of commands' },
+    { name: 'ping', description: "Shows Vlein's latency" },
+    { name: 'uptime', description: 'Shows how long Vlein has been running' },
+    { name: 'stats', description: "Shows Vlein's server/guild stats" },
+    { name: 'mood', description: "Shows Vlein's current mood" },
+    { name: 'invite', description: 'Gets an invite link to add Vlein to another server' },
+  ],
+  utility: [
+    { name: 'serverinfo', description: 'Shows info about this server' },
+    { name: 'userinfo [@user]', description: "Shows info about you or someone else" },
+    { name: 'afk [reason]', description: "Marks you as AFK; Vlein lets people know if they mention you" },
+    { name: 'remind <time> <message>', description: 'Sets a reminder (e.g. `v!remind 10m stretch`)' },
+    { name: 'reminders', description: 'Lists your active reminders' },
+    { name: 'snipe', description: 'Shows the last deleted message in this channel' },
+  ],
+  fun: [
+    { name: 'poll <question>', description: 'Creates a 👍/👎 poll' },
+    { name: 'coinflip', description: 'Flips a coin' },
+    { name: 'roll [XdY]', description: 'Rolls dice, e.g. `v!roll 2d6` (defaults to 1d6)' },
+  ],
+  music: [
+    { name: 'profile [@user]', description: "Shows a music profile (yours or someone else's)" },
+    { name: 'play <song or link>', description: 'Plays a song or playlist in your voice channel' },
+  ],
+  // NOTE: I don't have your actual moderation command files, so these are
+  // placeholder names covering the standard set (kick/ban/timeout/warn/
+  // clear/slowmode/lock). If your real commands use different names,
+  // just edit this list to match — it's purely for the help display.
+  moderation: [
+    { name: 'kick @user [reason]', description: 'Kicks a member from the server' },
+    { name: 'ban @user [reason]', description: 'Bans a member from the server' },
+    { name: 'unban <userId>', description: 'Unbans a user by ID' },
+    { name: 'timeout @user <duration> [reason]', description: 'Times out (mutes) a member' },
+    { name: 'untimeout @user', description: "Removes a member's timeout" },
+    { name: 'warn @user <reason>', description: 'Issues a warning to a member' },
+    { name: 'warnings @user', description: "Shows a member's warning history" },
+    { name: 'clear <amount>', description: 'Bulk-deletes messages in the current channel' },
+    { name: 'slowmode <seconds>', description: 'Sets slowmode for the current channel' },
+    { name: 'lock / unlock', description: 'Locks or unlocks the current channel' },
+  ],
+};
 
-function buildHelpEmbed() {
+// Whether the given member should see the moderation section — real
+// Discord permissions, not just config, so it can't accidentally leak.
+function canSeeModerationHelp(member) {
+  if (!member) return false;
+  if (isBotOwner(member.id)) return true;
+  return member.permissions?.has?.(PermissionFlagsBits.KickMembers)
+    || member.permissions?.has?.(PermissionFlagsBits.BanMembers)
+    || member.permissions?.has?.(PermissionFlagsBits.ModerateMembers);
+}
+
+function buildHelpEmbed(member) {
   const prefix = getCommandPrefix();
+  const formatList = (cmds) => cmds.map((cmd) => `\`${prefix}${cmd.name}\` — ${cmd.description}`).join('\n');
+
+  const fields = [
+    { name: '📖 General', value: formatList(helpCategories.general) },
+    { name: '🛠️ Utility', value: formatList(helpCategories.utility) },
+  ];
+
+  if (isFeatureEnabled('fun')) {
+    fields.push({ name: '🎉 Fun', value: formatList(helpCategories.fun) });
+  }
+
+  if (isFeatureEnabled('music')) {
+    fields.push({ name: '🎵 Music', value: formatList(helpCategories.music) });
+  }
+
+  if (isFeatureEnabled('moderation') && canSeeModerationHelp(member)) {
+    fields.push({ name: '🛡️ Moderation (staff only)', value: formatList(helpCategories.moderation) });
+  }
+
   return {
     title: '📖 Vlein — Commands',
-    description: builtInCommandList
-      .map((cmd) => `\`${prefix}${cmd.name}\` — ${cmd.description}`)
-      .join('\n'),
+    fields,
     color: getColor('primary'),
     footer: { text: botConfig.embeds.footer.text },
+  };
+}
+
+function buildServerInfoEmbed(guild) {
+  return {
+    title: `🏠 ${guild.name}`,
+    thumbnail: guild.iconURL ? { url: guild.iconURL() } : undefined,
+    fields: [
+      { name: 'Server ID', value: guild.id, inline: true },
+      { name: 'Members', value: String(guild.memberCount), inline: true },
+      { name: 'Created', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:D>`, inline: true },
+      { name: 'Owner', value: `<@${guild.ownerId}>`, inline: true },
+    ],
+    color: getColor('primary'),
+  };
+}
+
+function buildUserInfoEmbed(user, member) {
+  return {
+    title: `👤 ${user.username}`,
+    thumbnail: { url: user.displayAvatarURL?.() ?? '' },
+    fields: [
+      { name: 'User ID', value: user.id, inline: true },
+      { name: 'Account Created', value: `<t:${Math.floor(user.createdTimestamp / 1000)}:D>`, inline: true },
+      ...(member?.joinedTimestamp
+        ? [{ name: 'Joined Server', value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:D>`, inline: true }]
+        : []),
+      ...(member ? [{ name: 'Roles', value: String(Math.max(0, member.roles.cache.size - 1)) }] : []),
+    ],
+    color: getColor('primary'),
   };
 }
 
@@ -1124,6 +1263,81 @@ function buildStatsEmbed(client) {
     color: getColor('primary'),
     footer: { text: botConfig.embeds.footer.text },
   };
+}
+
+// =========================================================
+// AFK SYSTEM
+// =========================================================
+const afkUsers = new Map(); // userId -> { reason, since }
+
+function setAfk(userId, reason) {
+  afkUsers.set(userId, { reason: reason || 'AFK', since: Date.now() });
+}
+
+function clearAfk(userId) {
+  afkUsers.delete(userId);
+}
+
+// =========================================================
+// REMINDERS
+// =========================================================
+const remindersConfig = {
+  maxPerUser: 10,
+  minMs: 10 * 1000,      // 10 seconds
+  maxMs: 7 * 24 * 60 * 60 * 1000, // 7 days
+};
+const userReminders = new Map(); // userId -> [{ id, text, dueAt, timeout }]
+
+function parseDuration(input) {
+  const match = /^(\d+)(s|m|h|d)$/i.exec(input.trim());
+  if (!match) return null;
+  const amount = parseInt(match[1], 10);
+  const unitMs = { s: 1000, m: 60000, h: 3600000, d: 86400000 }[match[2].toLowerCase()];
+  return amount * unitMs;
+}
+
+function scheduleReminder(client, userId, channelId, text, durationMs) {
+  const id = `${userId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const dueAt = Date.now() + durationMs;
+
+  const timeout = setTimeout(async () => {
+    try {
+      const list = userReminders.get(userId) ?? [];
+      userReminders.set(userId, list.filter((r) => r.id !== id));
+
+      const channel = await client.channels.fetch(channelId).catch(() => null);
+      if (channel?.send) {
+        await channel.send({
+          content: `<@${userId}>`,
+          embeds: [{ title: '⏰ Reminder', description: text, color: getColor('primary') }],
+        }).catch(() => {});
+      }
+    } catch (err) {
+      logger.error('Error firing reminder:', err);
+    }
+  }, durationMs);
+
+  const list = userReminders.get(userId) ?? [];
+  list.push({ id, text, dueAt, timeout });
+  userReminders.set(userId, list);
+  return { id, dueAt };
+}
+
+// =========================================================
+// SNIPE (last deleted message per channel)
+// =========================================================
+const lastDeletedByChannel = new Map(); // channelId -> { authorTag, content, deletedAt }
+
+// =========================================================
+// FUN HELPERS
+// =========================================================
+function rollDice(input) {
+  const match = /^(\d*)d(\d+)$/i.exec((input || '1d6').trim());
+  if (!match) return null;
+  const count = Math.min(20, Math.max(1, parseInt(match[1] || '1', 10)));
+  const sides = Math.min(1000, Math.max(2, parseInt(match[2], 10)));
+  const rolls = Array.from({ length: count }, () => 1 + Math.floor(Math.random() * sides));
+  return { rolls, total: rolls.reduce((a, b) => a + b, 0) };
 }
 
 // =========================================================
@@ -1227,6 +1441,57 @@ client.once('ready', () => {
   startMoodDecay(client);
 });
 
+// Caches the last deleted message per channel for v!snipe. Fully wrapped
+// so a weird deletion payload (e.g. from an uncached/partial message)
+// can't crash the bot.
+client.on('messageDelete', safe('messageDelete:snipe', async (message) => {
+  if (!message.channelId || message.author?.bot) return;
+  lastDeletedByChannel.set(message.channelId, {
+    authorTag: message.author?.tag ?? 'Unknown user',
+    content: message.content || '*(no text content)*',
+    deletedAt: Date.now(),
+  });
+  // Bound memory on a busy multi-channel bot.
+  if (lastDeletedByChannel.size > 10000) {
+    const oldestKey = lastDeletedByChannel.keys().next().value;
+    lastDeletedByChannel.delete(oldestKey);
+  }
+}));
+
+// Announces when someone joins or leaves the voice channel Vlein is
+// currently connected to (not every VC in the server — just her own
+// session, so it doesn't spam unrelated channels). Posts to the same
+// text channel the player is bound to.
+client.on('voiceStateUpdate', safe('voiceStateUpdate:announce', async (oldState, newState) => {
+  const member = newState.member ?? oldState.member;
+  if (!member || member.user.bot) return;
+
+  const manager = getMusicManager(client);
+  if (!manager) return;
+
+  const guildId = newState.guild?.id ?? oldState.guild?.id;
+  const player = manager.getPlayer?.(guildId) ?? manager.players?.get?.(guildId);
+  const botVoiceChannelId = player?.voiceChannelId ?? player?.voiceChannel;
+  const textChannelId = player?.textChannelId ?? player?.textChannel;
+  if (!botVoiceChannelId || !textChannelId) return;
+
+  const joined = newState.channelId === botVoiceChannelId && oldState.channelId !== botVoiceChannelId;
+  const left = oldState.channelId === botVoiceChannelId && newState.channelId !== botVoiceChannelId;
+  if (!joined && !left) return;
+
+  const textChannel = await client.channels.fetch(textChannelId).catch(() => null);
+  if (!textChannel?.send) return;
+
+  await textChannel.send({
+    embeds: [{
+      description: joined
+        ? `🔊 **${member.user.username}** joined the voice channel.`
+        : `🔇 **${member.user.username}** left the voice channel.`,
+      color: getColor(joined ? 'success' : 'gray'),
+    }],
+  }).catch((err) => logger.error('Error sending voice join/leave announcement:', err));
+}));
+
 // Slash commands: wrapped in try/catch so one broken command can't crash the bot.
 client.on('interactionCreate', safe('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
@@ -1252,20 +1517,26 @@ client.on('interactionCreate', safe('interactionCreate', async (interaction) => 
 client.on('messageCreate', safe('messageCreate:mood', async (message) => {
   if (message.author.bot) return;
 
+  let shift = 0;
   try {
-    const shift = detectMoodShift(message, client);
+    shift = detectMoodShift(message, client);
     if (shift !== 0) adjustMood(shift, client);
   } catch (err) {
     logger.error('Error updating mood:', err);
   }
 
+  const mentionsBot = message.mentions.has(client.user);
+  // Also respond to her name in plain text, not just an actual @mention —
+  // e.g. "hey vlein, what's up" works even without pinging her.
+  const mentionsByName = /\bvlein\b/i.test(message.content);
+  const directlyAddressed = mentionsBot || mentionsByName;
+
   try {
     const prefix = getCommandPrefix();
     const isCommand = message.content.startsWith(prefix);
-    const mentionsBot = message.mentions.has(client.user);
-    // Only reply to a bare mention, not when it's part of a v! command
-    // (e.g. "v!mood @Vlein") to avoid double-replying.
-    if (mentionsBot && !isCommand && canReplyToMention(message.channelId)) {
+    // Only reply to a bare mention/name-drop, not when it's part of a v!
+    // command (e.g. "v!mood @Vlein") to avoid double-replying.
+    if (directlyAddressed && !isCommand && canReplyToMention(message.channelId)) {
       const tier = getMoodTier();
       const replyText = await getVleinReply(message.content, tier.label);
       await message.reply(replyText).catch((err) => {
@@ -1274,6 +1545,43 @@ client.on('messageCreate', safe('messageCreate:mood', async (message) => {
     }
   } catch (err) {
     logger.error('Error handling mention reply:', err);
+  }
+
+  // Flustered live reaction to a compliment/insult said WITHOUT directly
+  // addressing her (e.g. "good bot" in normal chat) — the case above
+  // already covers direct mentions/name-drops, so this only fires for
+  // the "bot"-word trigger to avoid double-replying to the same message.
+  try {
+    if (shift !== 0 && !directlyAddressed && canReplyToMoodReaction(message.channelId)) {
+      const tier = getMoodTier();
+      const reactionText = await getVleinReply(message.content, tier.label);
+      await message.channel.send(reactionText).catch((err) => {
+        logger.error('Error sending mood reaction:', err);
+      });
+    }
+  } catch (err) {
+    logger.error('Error handling mood reaction:', err);
+  }
+}));
+
+// AFK system: clears your own AFK when you speak again, and lets people
+// know if they mention someone who's currently AFK.
+client.on('messageCreate', safe('messageCreate:afk', async (message) => {
+  if (message.author.bot) return;
+
+  if (afkUsers.has(message.author.id)) {
+    clearAfk(message.author.id);
+    await message.reply(`Welcome back! I removed your AFK status. 👋`).catch(() => {});
+  }
+
+  const mentionedAfkUsers = [...message.mentions.users.values()].filter((u) => afkUsers.has(u.id));
+  if (mentionedAfkUsers.length > 0) {
+    const lines = mentionedAfkUsers.map((u) => {
+      const info = afkUsers.get(u.id);
+      const minutesAgo = Math.max(0, Math.floor((Date.now() - info.since) / 60000));
+      return `**${u.username}** is AFK: ${info.reason} (${minutesAgo}m ago)`;
+    });
+    await message.reply(lines.join('\n')).catch(() => {});
   }
 }));
 
@@ -1303,7 +1611,144 @@ client.on('messageCreate', safe('messageCreate:commands', async (message) => {
 
   // Built-in help command — lists everything below.
   if (commandName === 'help') {
-    await message.reply({ embeds: [buildHelpEmbed()] }).catch(() => {});
+    await message.reply({ embeds: [buildHelpEmbed(message.member)] }).catch(() => {});
+    return;
+  }
+
+  // Built-in invite command.
+  if (commandName === 'invite') {
+    const inviteUrl = `https://discord.com/oauth2/authorize?client_id=${client.user.id}&scope=bot%20applications.commands`;
+    await message.reply(`Here's my invite link! 💕\n${inviteUrl}\n(Customize permissions in the Discord Developer Portal if needed.)`).catch(() => {});
+    return;
+  }
+
+  // Built-in serverinfo command.
+  if (commandName === 'serverinfo') {
+    if (!message.guild) {
+      await message.reply("This only works in a server, not DMs!").catch(() => {});
+      return;
+    }
+    await message.reply({ embeds: [buildServerInfoEmbed(message.guild)] }).catch(() => {});
+    return;
+  }
+
+  // Built-in userinfo command.
+  if (commandName === 'userinfo') {
+    const targetUser = message.mentions.users.first() ?? message.author;
+    const targetMember = message.mentions.members?.first() ?? message.member;
+    await message.reply({ embeds: [buildUserInfoEmbed(targetUser, targetMember)] }).catch(() => {});
+    return;
+  }
+
+  // Built-in afk command.
+  if (commandName === 'afk') {
+    const reason = args.join(' ').trim();
+    setAfk(message.author.id, reason);
+    await message.reply(`You're now marked as AFK${reason ? `: ${reason}` : ''}. I'll clear it when you next speak.`).catch(() => {});
+    return;
+  }
+
+  // Built-in remind command — "v!remind 10m walk the dog".
+  if (commandName === 'remind') {
+    const durationInput = args[0];
+    const text = args.slice(1).join(' ').trim();
+    const durationMs = durationInput ? parseDuration(durationInput) : null;
+
+    if (!durationMs || !text) {
+      await message.reply('Usage: `v!remind <time> <message>` — e.g. `v!remind 10m stretch your legs`. Time units: s/m/h/d.').catch(() => {});
+      return;
+    }
+    if (durationMs < remindersConfig.minMs || durationMs > remindersConfig.maxMs) {
+      await message.reply('Reminders must be between 10 seconds and 7 days out.').catch(() => {});
+      return;
+    }
+    const existing = userReminders.get(message.author.id) ?? [];
+    if (existing.length >= remindersConfig.maxPerUser) {
+      await message.reply(`You've hit the limit of ${remindersConfig.maxPerUser} active reminders. Wait for one to fire first.`).catch(() => {});
+      return;
+    }
+
+    const { dueAt } = scheduleReminder(client, message.author.id, message.channelId, text, durationMs);
+    await message.reply(`Got it! I'll remind you <t:${Math.floor(dueAt / 1000)}:R>.`).catch(() => {});
+    return;
+  }
+
+  // Built-in reminders command — lists active reminders for you.
+  if (commandName === 'reminders') {
+    const list = userReminders.get(message.author.id) ?? [];
+    if (!list.length) {
+      await message.reply("You don't have any active reminders.").catch(() => {});
+      return;
+    }
+    const description = list
+      .map((r) => `• ${r.text} — <t:${Math.floor(r.dueAt / 1000)}:R>`)
+      .join('\n');
+    await message.reply({ embeds: [{ title: '⏰ Your Reminders', description, color: getColor('primary') }] }).catch(() => {});
+    return;
+  }
+
+  // Built-in snipe command — shows the last deleted message in this channel.
+  if (commandName === 'snipe') {
+    const sniped = lastDeletedByChannel.get(message.channelId);
+    if (!sniped) {
+      await message.reply('Nothing to snipe here!').catch(() => {});
+      return;
+    }
+    await message.reply({
+      embeds: [{
+        author: { name: sniped.authorTag },
+        description: sniped.content,
+        footer: { text: `Deleted ${Math.max(0, Math.floor((Date.now() - sniped.deletedAt) / 1000))}s ago` },
+        color: getColor('gray'),
+      }],
+    }).catch(() => {});
+    return;
+  }
+
+  // Built-in poll command.
+  if (commandName === 'poll') {
+    const question = args.join(' ').trim();
+    if (!isFeatureEnabled('fun')) {
+      await message.reply(getBotMessage('commandDisabled')).catch(() => {});
+      return;
+    }
+    if (!question) {
+      await message.reply('Usage: `v!poll <question>`').catch(() => {});
+      return;
+    }
+    const pollMessage = await message.reply({
+      embeds: [{ title: '📊 Poll', description: question, footer: { text: `Asked by ${message.author.username}` }, color: getColor('primary') }],
+    }).catch(() => null);
+    if (pollMessage) {
+      await pollMessage.react('👍').catch(() => {});
+      await pollMessage.react('👎').catch(() => {});
+    }
+    return;
+  }
+
+  // Built-in coinflip command.
+  if (commandName === 'coinflip') {
+    if (!isFeatureEnabled('fun')) {
+      await message.reply(getBotMessage('commandDisabled')).catch(() => {});
+      return;
+    }
+    const result = Math.random() < 0.5 ? 'Heads' : 'Tails';
+    await message.reply(`🪙 **${result}**!`).catch(() => {});
+    return;
+  }
+
+  // Built-in dice roll command — "v!roll 2d6".
+  if (commandName === 'roll') {
+    if (!isFeatureEnabled('fun')) {
+      await message.reply(getBotMessage('commandDisabled')).catch(() => {});
+      return;
+    }
+    const rolled = rollDice(args[0]);
+    if (!rolled) {
+      await message.reply('Usage: `v!roll [XdY]` — e.g. `v!roll 2d6` (defaults to 1d6).').catch(() => {});
+      return;
+    }
+    await message.reply(`🎲 Rolled: ${rolled.rolls.join(', ')} — **Total: ${rolled.total}**`).catch(() => {});
     return;
   }
 
